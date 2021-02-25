@@ -5,7 +5,6 @@ import (
 	"errors"
 	"log"
 	"time"
-
 	"github.com/davecheney/gpio"
 	"github.com/fulr/spidev"
 )
@@ -21,19 +20,18 @@ var frequencies = map[string][]byte{
 }
 
 // OnReceiveHandler is the receive callback
-type OnReceiveHandler func(*Data)
+type OnReceiveHandler func(*RXStream)
 
 // Device RFM69 Device
 type Device struct {
 	spiDevice  *spidev.SPIDevice
 	gpio       gpio.Pin
 	mode       byte
-	address    byte
-	network    byte
 	isRFM69HW  bool
 	powerLevel byte
 	tx         chan *Data
 	quit       chan bool
+	_invert    bool
 	OnReceive  OnReceiveHandler
 }
 
@@ -44,7 +42,7 @@ const (
 )
 
 // NewDevice creates a new device
-func NewDevice(nodeID, networkID byte, isRfm69HW bool) (*Device, error) {
+func NewDevice(isRfm69HW bool) (*Device, error) {
 	pin, err := getPin()
 	if err != nil {
 		return nil, err
@@ -58,10 +56,9 @@ func NewDevice(nodeID, networkID byte, isRfm69HW bool) (*Device, error) {
 	ret := &Device{
 		spiDevice:  spi,
 		gpio:       pin,
-		network:    networkID,
-		address:    nodeID,
 		isRFM69HW:  isRfm69HW,
 		powerLevel: 31,
+		_invert: false,
 		tx:         make(chan *Data, 5),
 		quit:       make(chan bool),
 	}
@@ -71,7 +68,7 @@ func NewDevice(nodeID, networkID byte, isRfm69HW bool) (*Device, error) {
 		return nil, err
 	}
 
-	go ret.loop()
+	//go ret.loop()
 
 	return ret, nil
 }
@@ -99,6 +96,21 @@ func (r *Device) writeReg(addr, data byte) error {
 	}
 	return err
 }
+func (r *Device) writeRegDouble(addr byte, data uint16) error {
+	tx := make([]byte, 3)
+	tx[0] = addr | 0x80
+	tx[1] = byte((data >>  8) & 0xFF)
+	tx[2] = byte(data & 0xFF)
+	//log.Printf("write %x: %x", addr, data)
+	_, err := r.spiDevice.Xfer(tx)
+	if err != nil {
+		log.Println(err)
+	}
+	return err
+}
+func (r *Device) WriteReg(addr, data byte) error {
+	return r.writeReg(addr, data)
+}
 
 func (r *Device) readReg(addr byte) (byte, error) {
 	tx := make([]uint8, 2)
@@ -115,10 +127,10 @@ func (r *Device) setup() error {
 	config := [][]byte{
 		/* 0x01 */ {REG_OPMODE, RF_OPMODE_SEQUENCER_ON | RF_OPMODE_LISTEN_OFF | RF_OPMODE_STANDBY},
 		/* 0x02 */ {REG_DATAMODUL, RF_DATAMODUL_DATAMODE_PACKET | RF_DATAMODUL_MODULATIONTYPE_FSK | RF_DATAMODUL_MODULATIONSHAPING_00}, // no shaping
-		/* 0x03 */ {REG_BITRATEMSB, RF_BITRATEMSB_55555}, // default: 4.8 KBPS
-		/* 0x04 */ {REG_BITRATELSB, RF_BITRATELSB_55555},
-		/* 0x05 */ {REG_FDEVMSB, RF_FDEVMSB_50000}, // default: 5KHz, (FDEV + BitRate / 2 <= 500KHz)
-		/* 0x06 */ {REG_FDEVLSB, RF_FDEVLSB_50000},
+		/* 0x03 */ {REG_BITRATEMSB, 0x68},
+		/* 0x04 */ {REG_BITRATELSB, 0x2B},
+		/* 0x05 */ {REG_FDEVMSB, 0x00}, // default: 5KHz, (FDEV + BitRate / 2 <= 500KHz)
+		/* 0x06 */ {REG_FDEVLSB, 0x4a},
 		/* 0x07 */ {REG_FRFMSB, RF_FRFMSB_868},
 		/* 0x08 */ {REG_FRFMID, RF_FRFMID_868},
 		/* 0x09 */ {REG_FRFLSB, RF_FRFLSB_868},
@@ -133,18 +145,23 @@ func (r *Device) setup() error {
 		/* 0x19 */ {REG_RXBW, RF_RXBW_DCCFREQ_010 | RF_RXBW_MANT_16 | RF_RXBW_EXP_2}, // (BitRate < 2 * RxBw)
 		//for BR-19200: /* 0x19 */ { REG_RXBW, RF_RXBW_DCCFREQ_010 | RF_RXBW_MANT_24 | RF_RXBW_EXP_3 },
 		/* 0x25 */ {REG_DIOMAPPING1, RF_DIOMAPPING1_DIO0_01}, // DIO0 is the only IRQ we're using
-		/* 0x26 */ {REG_DIOMAPPING2, RF_DIOMAPPING2_CLKOUT_OFF}, // DIO5 ClkOut disable for power saving
+		/* 0x26 */ {REG_DIOMAPPING2, RF_DIOMAPPING2_CLKOUT_OFF }, // DIO5 ClkOut disable for power saving
 		/* 0x28 */ {REG_IRQFLAGS2, RF_IRQFLAGS2_FIFOOVERRUN}, // writing to this bit ensures that the FIFO & status flags are reset
-		/* 0x29 */ //{REG_RSSITHRESH, 220}, // must be set to dBm = (-Sensitivity / 2), default is 0xE4 = 228 so -114dBm
+		/* 0x29 */ {REG_RSSITHRESH, 220}, // must be set to dBm = (-Sensitivity / 2), default is 0xE4 = 228 so -114dBm
 		///* 0x2D */ { REG_PREAMBLELSB, RF_PREAMBLESIZE_LSB_VALUE } // default 3 preamble bytes 0xAAAAAA
-		/* 0x2E */ {REG_SYNCCONFIG, RF_SYNC_ON | RF_SYNC_FIFOFILL_AUTO | RF_SYNC_SIZE_2 | RF_SYNC_TOL_0},
-		/* 0x2F */ {REG_SYNCVALUE1, 0x2D}, // attempt to make this compatible with sync1 byte of RFM12B lib
-		/* 0x30 */ {REG_SYNCVALUE2, r.network}, // NETWORK ID
-		/* 0x37 */ {REG_PACKETCONFIG1, RF_PACKET1_FORMAT_VARIABLE | RF_PACKET1_DCFREE_OFF | RF_PACKET1_CRC_ON | RF_PACKET1_CRCAUTOCLEAR_ON | RF_PACKET1_ADRSFILTERING_OFF},
-		/* 0x38 */ {REG_PAYLOADLENGTH, 66}, // in variable length mode: the max frame size, not used in TX
+		/* 0x2E */ {REG_SYNCCONFIG, RF_SYNC_ON | RF_SYNC_FIFOFILL_AUTO | RF_SYNC_SIZE_6 | RF_SYNC_TOL_0},
+		/* 0x2F */ {REG_SYNCVALUE1, 0xAA},
+		/* 0x30 */ {REG_SYNCVALUE2, 0xAA},
+		/* 0x30 */ {REG_SYNCVALUE3, 0xAA},
+		/* 0x30 */ {REG_SYNCVALUE4, 0xAA},
+		/* 0x30 */ {REG_SYNCVALUE5, 0xAA},
+		/* 0x30 */ {REG_SYNCVALUE6, 0xAA},
+		/* 0x37 */ {REG_PACKETCONFIG1, RF_PACKET1_FORMAT_FIXED | RF_PACKET1_DCFREE_OFF | RF_PACKET1_CRC_OFF | RF_PACKET1_CRCAUTOCLEAR_ON | RF_PACKET1_ADRSFILTERING_OFF},
+		/* 0x38 */ {REG_PAYLOADLENGTH, 0x00}, // in variable length mode: the max frame size, not used in TX, 0: unlimited packet format
 		///* 0x39 */ { REG_NODEADRS, nodeID }, // turned off because we're not using address filtering
 		/* 0x3C */ {REG_FIFOTHRESH, RF_FIFOTHRESH_TXSTART_FIFONOTEMPTY | RF_FIFOTHRESH_VALUE}, // TX on FIFO not empty
 		/* 0x3D */ {REG_PACKETCONFIG2, RF_PACKET2_RXRESTARTDELAY_2BITS | RF_PACKET2_AUTORXRESTART_ON | RF_PACKET2_AES_OFF}, // RXRESTARTDELAY must match transmitter PA ramp-down time (bitrate dependent)
+		/* 0x2D */ {REG_PREAMBLELSB, 0x00},
 		//for BR-19200: /* 0x3D */ { REG_PACKETCONFIG2, RF_PACKET2_RXRESTARTDELAY_NONE | RF_PACKET2_AUTORXRESTART_ON | RF_PACKET2_AES_OFF }, // RXRESTARTDELAY must match transmitter PA ramp-down time (bitrate dependent)
 		/* 0x6F */ {REG_TESTDAGC, RF_DAGC_IMPROVED_LOWBETA0}, // run DAGC continuously in RX mode for Fading Margin Improvement, recommended default for AfcLowBetaOn=0
 	}
@@ -170,6 +187,10 @@ func (r *Device) setup() error {
 	if err != nil {
 		return err
 	}
+	err = r.SetInvert(false)
+	if err != nil {
+		return err
+	}
 	err = r.setHighPower(r.isRFM69HW)
 	if err != nil {
 		return err
@@ -181,7 +202,19 @@ func (r *Device) setup() error {
 	err = r.waitForMode()
 	return err
 }
-
+func (r *Device) SetInvert(invert bool) error {
+	r._invert = invert
+	if (r._invert) {
+		r.WriteReg(REG_SYNCVALUE1, 0x55)
+		r.WriteReg(REG_SYNCVALUE2, 0x55)
+		r.WriteReg(REG_SYNCVALUE3, 0x55)
+	} else  {
+		r.WriteReg(REG_SYNCVALUE1, 0xAA)
+		r.WriteReg(REG_SYNCVALUE2, 0xAA)
+		r.WriteReg(REG_SYNCVALUE3, 0xAA)
+	}
+	return nil
+}
 func (r *Device) waitForMode() error {
 	errChan := make(chan error)
 	go func() {
@@ -202,6 +235,9 @@ func (r *Device) waitForMode() error {
 	})
 	return <-errChan
 }
+func (r *Device) WaitForMode() error {
+	return r.waitForMode();
+}
 
 // Encrypt sets the encryption key and enables AES encryption
 func (r *Device) Encrypt(key []byte) error {
@@ -218,14 +254,29 @@ func (r *Device) Encrypt(key []byte) error {
 	return r.readWriteReg(REG_PACKETCONFIG2, 0xFE, turnOn)
 }
 
-func (r *Device) SetFrequency(freq string) error {
-	freq_bytes, found := frequencies[freq]
-	if !found {
-		return errors.New("frequency not found")
+func (r *Device) SetBaudrate(rate int) error {
+	var divider uint16 =  (uint16)(32e6 / rate) //0x4F4F
+	
+	/*switch(rate) {
+		case 1200:
+			divider = 0x682B
+		case 2400:
+			divider = 0x3415
+	}*/
+	return r.writeRegDouble(REG_BITRATEMSB, divider)
+}
+func (r *Device) SetFrequency(freqHz, offset int) error {
+    //freqHz =   // divide down by FSTEP to get FRF
+	frf := (int)((float32(freqHz) / float32(61.03515625))) + offset  // offset per chip (you may have to calibrate)
+	if err := r.writeReg(REG_FRFMSB, byte((frf >> 16) & 0xFF)); err != nil {
+		return err
 	}
-	r.writeReg(REG_FRFMSB, freq_bytes[0])
-	r.writeReg(REG_FRFMID, freq_bytes[1])
-	r.writeReg(REG_FRFLSB, freq_bytes[2])
+	if err := r.writeReg(REG_FRFMID, byte((frf >>  8) & 0xFF)); err != nil {
+		return err
+	}
+	if err := r.writeReg(REG_FRFLSB, byte(frf & 0xFF)); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -303,18 +354,6 @@ func (r *Device) setHighPowerRegs(turnOn bool) (err error) {
 	return
 }
 
-// SetNetwork sets the network ID
-func (r *Device) SetNetwork(networkID byte) error {
-	r.network = networkID
-	return r.writeReg(REG_SYNCVALUE2, networkID)
-}
-
-// SetAddress sets the node address
-func (r *Device) SetAddress(address byte) error {
-	r.address = address
-	return r.writeReg(REG_NODEADRS, address)
-}
-
 // SetPowerLevel sets the TX power
 func (r *Device) SetPowerLevel(powerLevel byte) error {
 	r.powerLevel = powerLevel
@@ -373,53 +412,92 @@ func (r *Device) readWriteReg(reg, andMask, orMask byte) error {
 	return r.writeReg(reg, regValue)
 }
 
-func (r *Device) writeFifo(data *Data) error {
-	buffersize := len(data.Data)
+func (r *Device) writeFifo(data []byte) error {
+	buffersize := len(data)
 	if buffersize > MaxDataLen {
 		buffersize = MaxDataLen
 	}
-	tx := make([]byte, buffersize+5)
+	tx := make([]byte, buffersize+1)
 	// write to FIFO
 	tx[0] = REG_FIFO | 0x80
-	tx[1] = byte(buffersize + 3)
-	tx[2] = data.ToAddress
-	tx[3] = r.address
-	if data.RequestAck {
-		tx[4] = 0x40
-	}
-	if data.SendAck {
-		tx[4] = 0x80
-	}
-	copy(tx[5:], data.Data[:buffersize])
+	copy(tx[1:], data[:buffersize])
+	//log.Println("% X\n\n", tx)
 	_, err := r.spiDevice.Xfer(tx)
 	return err
+}
+
+func (r *Device) WriteFifoData(data []byte) error {
+	if err := r.writeFifo(data); err != nil {
+		return err
+	}
+	return nil
+}
+func (r *Device) WriteFifoDataWait() error {
+	errChan := make(chan error)
+	go func() {
+		for {
+			reg, err := r.readReg(REG_IRQFLAGS2)
+			if err != nil {
+				log.Fatal(err)
+				panic(err)
+				errChan <- err
+				break
+			}
+			log.Println("% X", reg)
+			if reg&RF_IRQFLAGS2_FIFONOTEMPTY != 0 {
+				errChan <- nil
+				break
+			}
+		}
+	}()
+	time.AfterFunc(2*time.Second, func() {
+		errChan <- errors.New("timeout fifowait")
+	})
+	return <-errChan
 }
 
 func (r *Device) readFifo() (Data, error) {
 	var err error
 	data := Data{}
-	data.Rssi, err = r.readRSSI(false)
+	/*data.Rssi, err = r.readRSSI(false)
 	if err != nil {
 		return data, err
-	}
+	}*/
 	tx := new([67]byte)
 	tx[0] = REG_FIFO & 0x7f
-	rx, err := r.spiDevice.Xfer(tx[:3])
+	rx, err := r.spiDevice.Xfer(tx[:1])
+	if err != nil {
+		return data, err
+	}  
+	rx, err = r.spiDevice.Xfer(tx[1:])
 	if err != nil {
 		return data, err
 	}
-	data.ToAddress = rx[2]
-	length := rx[1] - 3
-	if length > 66 {
-		length = 66
-	}
-	rx, err = r.spiDevice.Xfer(tx[:length+3])
-	if err != nil {
-		return data, err
-	}
-	data.FromAddress = rx[1]
-	data.SendAck = bool(rx[2]&0x80 > 0)
-	data.RequestAck = bool(rx[2]&0x40 > 0)
-	data.Data = rx[3:]
+	data.Data = rx[1:]
 	return data, nil
 }
+func (r *Device) readFifo1Byte() (byte, error) {
+	var err error
+	log.Println("readFifo1Byte()")
+	tx := new([2]byte)
+	tx[0] = REG_FIFO & 0x7f
+	log.Println(tx)
+	rx, err := r.spiDevice.Xfer(tx[:1])
+	if err != nil {
+		return rx[1], err
+	} 
+	log.Println(rx)
+	rx, err = r.spiDevice.Xfer(tx[1:])
+	if err != nil {
+		return rx[1], err
+	}
+	log.Println(rx)
+	return rx[0], nil
+}
+
+
+
+
+
+
+

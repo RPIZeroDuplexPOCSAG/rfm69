@@ -3,7 +3,7 @@ package rfm69
 import "github.com/davecheney/gpio"
 
 const (
-	irqPin = gpio.GPIO25
+	irqPin = 18
 )
 
 func getPin() (gpio.Pin, error) {
