@@ -33,6 +33,14 @@ type Device struct {
 	quit       chan bool
 	_invert    bool
 	OnReceive  OnReceiveHandler
+
+	FreqOffset	int
+	TXBaud		int
+	TXFreq		int
+	TXPower		int
+
+	RXBaud		int
+	RXFreq		int
 }
 
 // Global settings
@@ -61,6 +69,12 @@ func NewDevice(isRfm69HW bool) (*Device, error) {
 		_invert: false,
 		tx:         make(chan *Data, 5),
 		quit:       make(chan bool),
+
+		FreqOffset: 0,
+		TXBaud:		1200,
+		TXFreq:		433e6,
+		RXBaud:		1200,
+		RXFreq:		433e6,
 	}
 
 	err = ret.setup()
@@ -476,28 +490,24 @@ func (r *Device) readFifo() (Data, error) {
 	data.Data = rx[1:]
 	return data, nil
 }
-func (r *Device) readFifo1Byte() (byte, error) {
-	var err error
-	log.Println("readFifo1Byte()")
-	tx := new([2]byte)
-	tx[0] = REG_FIFO & 0x7f
-	log.Println(tx)
-	rx, err := r.spiDevice.Xfer(tx[:1])
-	if err != nil {
-		return rx[1], err
-	} 
-	log.Println(rx)
-	rx, err = r.spiDevice.Xfer(tx[1:])
-	if err != nil {
-		return rx[1], err
+
+
+
+func (r *Device) PrepareTX() (error) {
+	if err := r.SetFrequency(r.TXFreq, r.FreqOffset); err != nil {
+		return err
 	}
-	log.Println(rx)
-	return rx[0], nil
+	if err := r.SetBaudrate(r.TXBaud); err != nil {
+		return err
+	}
+	return nil
 }
-
-
-
-
-
-
-
+func (r *Device) PrepareRX() (error) {
+	if err := r.SetFrequency(r.RXFreq, r.FreqOffset); err != nil {
+		return err
+	}
+	if err := r.SetBaudrate(r.RXBaud); err != nil {
+		return err
+	}
+	return nil
+}

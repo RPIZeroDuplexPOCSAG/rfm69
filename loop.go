@@ -8,6 +8,9 @@ import (
 
 // Send data
 func (r *Device) Send(d *Data) {
+	if r.TXFreq == 0 {
+		return
+	}
 	if (r._invert) {
 		for i := 0; i < len(d.Data); i++ {
 			d.Data[i] = 255 - d.Data[i]
@@ -41,6 +44,7 @@ func (r *Device) Loop() {
 		select {
 		case dataToTransmit := <-r.tx:
 			log.Println("going to transmit");
+			r.PrepareTX();
 			// TODO: can send?
 			r.readWriteReg(REG_PACKETCONFIG2, 0xFB, RF_PACKET2_RXRESTART) // avoid RX deadlocks
 			err = r.SetModeAndWait(RF_OPMODE_STANDBY)
@@ -110,15 +114,19 @@ func (r *Device) Loop() {
 				log.Fatal(err)
 			}
 			log.Println("tx done");
+			r.PrepareRX();
 
+			break
 		case <-r.quit:
 			r.quit <- true
 			return
 		default:
+			if r.RXFreq == 0 {
+				continue
+			}
 			if r.mode != RF_OPMODE_RECEIVER {
 				continue
 			}
-
 			flags, err := r.readReg(REG_IRQFLAGS2)
 			if err != nil {
 				log.Fatal(err)
